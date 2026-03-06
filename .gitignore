@@ -1,0 +1,8 @@
+# Never push secrets or local data to GitHub
+.streamlit/secrets.toml
+data/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.DS_Store

@@ -649,12 +649,20 @@ def exec_overview():
 
 
 def exec_mark_tasks():
+    # ── Week selector — current + last 8 weeks ──
+    today = date.today()
+    week_options = [str(get_week_start(today - timedelta(weeks=i))) for i in range(8)]
+    selected_ws  = st.selectbox("📅 Select Week", week_options,
+                                format_func=lambda w: f"{week_label(w)}"
+                                                      + (" (Current)" if w==week_options[0] else ""),
+                                key="mt_week")
+    ws = date.fromisoformat(selected_ws)
+
     st.markdown(f'<div class="ph"><h1>✅ Mark Weekly Tasks</h1>'
-                f'<p>{week_label(get_week_start())} · Tick each completed activity</p></div>',
+                f'<p>{week_label(ws)} · Tick each completed activity</p></div>',
                 unsafe_allow_html=True)
     projects = get_projects()
     if not projects: st.info("No projects yet."); return
-    ws  = get_week_start()
     wt  = get_tasks_for_week(str(ws))
     all_am1 = sorted({p["am1"] for p in projects})
     c1,c2,c3 = st.columns(3)
@@ -696,7 +704,7 @@ def exec_mark_tasks():
         row[3].markdown(f"<p class='row-bold'>{p['name']}</p>", unsafe_allow_html=True)
         for i,tc in enumerate(TASK_COLS):
             cur     = existing.get(tc, False)
-            new_val = row[4+i].checkbox("", value=cur, key=f"cb_{p['id']}_{tc}")
+            new_val = row[4+i].checkbox("", value=cur, key=f"cb_{p['id']}_{tc}_{selected_ws}")
             if new_val != cur:
                 upsert_task(p["id"], p["am1"], p["am2"], tc, new_val, ws)
                 changed = True

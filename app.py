@@ -106,7 +106,7 @@ def add_project(name, am1, am2):
     db_insert("projects", {"id": str(uuid.uuid4()), "name": name, "am1": am1, "am2": am2})
 
 def delete_project(pid):
-    db_delete("projects", "id", f"eq.{pid}")
+    db_delete("projects", "id", pid)
 
 def get_tasks_for_week(week_start):
     return db_select("tasks", {"week_start": f"eq.{week_start}"})
@@ -124,7 +124,7 @@ def upsert_task(project_id, am1, am2, task_col, checked, ws):
         "task_col":   f"eq.{task_col}"
     })
     if existing:
-        db_update("tasks", "id", f"eq.{existing[0]['id']}",
+        db_update("tasks", "id", existing[0]['id'],
                   {"checked": checked, "updated_at": now})
     else:
         db_insert("tasks", {
@@ -1000,7 +1000,7 @@ def mgr_manage():
             opts={p["name"]:p["id"] for p in projects}
             del_n=st.selectbox("Select to remove",list(opts.keys()),key="del_p")
             if st.button("🗑️ Delete",type="secondary"):
-                db_delete("projects","id",f"eq.{opts[del_n]}")
+                db_delete("projects","id", opts[del_n])
                 st.success("Deleted."); st.rerun()
 
         if projects:
@@ -1040,7 +1040,7 @@ def mgr_manage():
                     if not new_pname or not am1f or not am2f:
                         st.error("All fields required")
                     else:
-                        db_update("projects", "id", f"eq.{sel_proj['id']}",
+                        db_update("projects", "id", sel_proj['id'],
                                   {"name": new_pname, "am1": am1f, "am2": am2f})
                         st.success(f"✅ '{new_pname}' updated!"); st.rerun()
 

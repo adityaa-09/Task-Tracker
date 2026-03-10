@@ -114,10 +114,11 @@ def get_tasks_for_week(week_start):
 def get_all_tasks():
     return db_select("tasks", order="week_start.desc")
 
-def upsert_task(project_id, am1, am2, task_col, checked, ws):
+def upsert_task(project_id, am1, am2, task_col, status, ws):
+    # status: "done", "na", "pending"
     ws_str = str(ws)
     now    = str(datetime.now())
-    # check if exists
+    checked = (status == "done")
     existing = db_select("tasks", {
         "project_id": f"eq.{project_id}",
         "week_start": f"eq.{ws_str}",
@@ -125,7 +126,7 @@ def upsert_task(project_id, am1, am2, task_col, checked, ws):
     })
     if existing:
         db_update("tasks", "id", existing[0]['id'],
-                  {"checked": checked, "updated_at": now})
+                  {"checked": checked, "status": status, "updated_at": now})
     else:
         db_insert("tasks", {
             "id": str(uuid.uuid4()),
@@ -133,6 +134,7 @@ def upsert_task(project_id, am1, am2, task_col, checked, ws):
             "am1": am1, "am2": am2,
             "task_col": task_col,
             "checked":  checked,
+            "status":   status,
             "week_start": ws_str,
             "month_label": month_label(ws.year, ws.month),
             "month": ws.month, "year": ws.year,
@@ -196,10 +198,23 @@ def generate_weekly_report(week_start_str):
     wt       = get_tasks_for_week(week_start_str)
     rows = []
     for p in projects:
-        task_map = {t["task_col"]: int(t["checked"]) for t in wt if t["project_id"]==p["id"]}
+        task_map = {}
+        for t in wt:
+            if t["project_id"] == p["id"]:
+                task_map[t["task_col"]] = t.get("status", "done" if t["checked"] else "pending")
         row = {"project_id":p["id"],"project_name":p["name"],"am1":p["am1"],"am2":p["am2"]}
-        for tc in TASK_COLS: row[tc] = task_map.get(tc, 0)
-        row["score"] = sum(row[tc] for tc in TASK_COLS)
+        applicable = 0
+        scored     = 0
+        for tc in TASK_COLS:
+            st_val = task_map.get(tc, "pending")
+            row[tc] = st_val
+            if st_val != "na":
+                applicable += 1
+                if st_val == "done":
+                    scored += 1
+        row["score"]       = scored
+        row["applicable"]  = applicable
+        row["max_possible"]= applicable
         rows.append(row)
     ws = date.fromisoformat(week_start_str)
     report = {
@@ -223,14 +238,21 @@ def generate_monthly_report(year, month):
     rows = []
     for p in projects:
         row = {"project_id":p["id"],"project_name":p["name"],"am1":p["am1"],"am2":p["am2"]}
+        total_scored = 0
+        total_applicable = 0
         for tc in TASK_COLS:
-            row[tc] = sum(1 for t in mt
-                          if t["project_id"]==p["id"] and t["task_col"]==tc and t["checked"])
-        row["total_score"]    = sum(row[tc] for tc in TASK_COLS)
+            proj_tasks = [t for t in mt if t["project_id"]==p["id"] and t["task_col"]==tc]
+            done  = sum(1 for t in proj_tasks if t.get("status","done" if t["checked"] else "pending")=="done")
+            na    = sum(1 for t in proj_tasks if t.get("status","")=="na")
+            applicable = len(weeks) - na
+            row[tc] = done
+            total_scored     += done
+            total_applicable += max(applicable, 0)
+        row["total_score"]    = total_scored
         row["weeks_tracked"]  = len(weeks)
-        row["max_possible"]   = len(weeks) * WEEKLY_TARGET
-        row["completion_pct"] = round(row["total_score"]/row["max_possible"]*100,1) \
-                                if row["max_possible"] else 0
+        row["max_possible"]   = total_applicable
+        row["completion_pct"] = round(total_scored/total_applicable*100,1) \
+                                if total_applicable else 0
         rows.append(row)
     report = {
         "id":          str(uuid.uuid4()),
@@ -448,9 +470,10 @@ def color_score_cell(val):
     else:       return "color:#166534;font-weight:800;background-color:#f0fdf4;text-align:center;"
 
 def color_task_cell(val):
-    if not isinstance(val,(int,float)): return ""
-    return ("color:#166534;font-weight:600;background-color:#f0fdf4;" if val==1
-            else "color:#94a3b8;background-color:#f8fafc;")
+    if val == "done" or val == 1:  return "color:#166534;font-weight:600;background-color:#f0fdf4;"
+    if val == "na":                return "color:#6366f1;font-weight:600;background-color:#eef2ff;"
+    if val == "pending" or val == 0: return "color:#94a3b8;background-color:#f8fafc;"
+    return ""
 
 def color_pct_cell(val):
     if not isinstance(val,(int,float)): return ""
@@ -692,28 +715,62 @@ def exec_mark_tasks():
             unsafe_allow_html=True)
     st.divider()
 
-    sr=1; changed=False
+    # state cycle: pending → done → na → pending
+    def next_status(s):
+        return {"pending":"done","done":"na","na":"pending"}.get(s,"done")
+
+    def status_icon(s):
+        return {"done":"✅","na":"➖","pending":"⬜"}.get(s,"⬜")
+
+    sr=1
     for p in filtered:
-        existing = {t["task_col"]:t["checked"] for t in wt if t["project_id"]==p["id"]}
-        score    = sum(existing.values())
-        row      = st.columns(COLS)
+        task_statuses = {}
+        for t in wt:
+            if t["project_id"] == p["id"]:
+                task_statuses[t["task_col"]] = t.get("status",
+                    "done" if t["checked"] else "pending")
+
+        applicable = sum(1 for tc in TASK_COLS if task_statuses.get(tc,"pending") != "na")
+        scored     = sum(1 for tc in TASK_COLS if task_statuses.get(tc,"pending") == "done")
+
+        row = st.columns(COLS)
         row[0].markdown(f"<p class='row-text' style='text-align:center'>{sr}</p>",
                         unsafe_allow_html=True)
         row[1].markdown(f"<p class='row-text'>{p['am1']}</p>", unsafe_allow_html=True)
         row[2].markdown(f"<p class='row-text'>{p['am2']}</p>", unsafe_allow_html=True)
         row[3].markdown(f"<p class='row-bold'>{p['name']}</p>", unsafe_allow_html=True)
-        for i,tc in enumerate(TASK_COLS):
-            cur     = existing.get(tc, False)
-            new_val = row[4+i].checkbox("", value=cur, key=f"cb_{p['id']}_{tc}_{selected_ws}")
-            if new_val != cur:
-                upsert_task(p["id"], p["am1"], p["am2"], tc, new_val, ws)
-                changed = True
-        row[9].markdown(score_html(score), unsafe_allow_html=True)
+
+        for i, tc in enumerate(TASK_COLS):
+            cur = task_statuses.get(tc, "pending")
+            btn_label = status_icon(cur)
+            if row[4+i].button(btn_label, key=f"btn_{p['id']}_{tc}_{selected_ws}",
+                               use_container_width=True):
+                upsert_task(p["id"], p["am1"], p["am2"], tc, next_status(cur), ws)
+                st.rerun()
+
+        # score badge: scored / applicable
+        score_display = f"{scored}/{applicable}"
+        if applicable == 0:
+            sc_class = "score-0"
+        elif scored == applicable:
+            sc_class = "score-high"
+        elif scored == 0:
+            sc_class = "score-0"
+        else:
+            sc_class = "score-low"
+        row[9].markdown(f'<span class="{sc_class}">{score_display}</span>',
+                        unsafe_allow_html=True)
         sr += 1
-    if changed: st.rerun()
+
     st.markdown(f"<p style='color:#94a3b8;font-size:.8rem;margin-top:.5rem'>"
                 f"Showing {sr-1} of {len(projects)} projects · auto-saved</p>",
                 unsafe_allow_html=True)
+    st.markdown("""
+    <div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;
+                padding:.6rem 1rem;margin-top:.5rem;font-size:.78rem;color:#475569'>
+        ✅ <b>Done</b> &nbsp;·&nbsp; ➖ <b>N/A</b> (not applicable, excluded from score)
+        &nbsp;·&nbsp; ⬜ <b>Pending</b> &nbsp;— click to cycle
+    </div>""", unsafe_allow_html=True)
 
 
 def exec_weekly_page():

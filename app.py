@@ -710,30 +710,11 @@ def exec_mark_tasks():
     ws = date.fromisoformat(selected_ws)
 
     st.markdown(f'<div class="ph"><h1>✅ Mark Weekly Tasks</h1>'
-                f'<p>{week_label(ws)} · Tick done · Check NA if not applicable</p></div>',
+                f'<p>{week_label(ws)} · Edit table below · Click <b>💾 Save</b> when done</p></div>',
                 unsafe_allow_html=True)
 
     projects = get_projects()
     if not projects: st.info("No projects yet."); return
-
-    # ── Load tasks into session_state cache (only on week change or first load) ──
-    cache_key = f"task_cache_{selected_ws}"
-    if cache_key not in st.session_state:
-        wt = get_tasks_for_week(str(ws))
-        cache = {}
-        for p in projects:
-            cache[p["id"]] = {}
-            for tc in TASK_COLS:
-                cache[p["id"]][tc] = "pending"
-        for t in wt:
-            pid = t["project_id"]
-            tc  = t["task_col"]
-            if pid in cache:
-                cache[pid][tc] = t.get("status",
-                    "done" if t.get("checked") else "pending")
-        st.session_state[cache_key] = cache
-
-    cache = st.session_state[cache_key]
 
     # ── Filters ──
     all_am1 = sorted({p["am1"] for p in projects})
@@ -751,85 +732,89 @@ def exec_mark_tasks():
                 and (f_am2=="All" or p["am2"]==f_am2)
                 and (f_proj=="All" or p["name"]==f_proj)]
 
-    # ── Column headers ──
-    COLS = [0.25, 1.1, 1.1, 2.2, 0.85, 0.85, 0.95, 0.85, 0.85, 0.6]
-    HDR  = ["Sr.", "AM1", "AM2", "Project",
-            "Review\nMtg", "PPC\nMtg", "Presales\nRev", "Mtg\nCP Agg", "MOM\nNurt.", "Score"]
-    hrow = st.columns(COLS)
-    for col, h in zip(hrow, HDR):
-        col.markdown(
-            f"<div style='background:#1e3a5f;color:white;font-weight:700;font-size:.68rem;"
-            f"text-align:center;padding:5px 2px;border-radius:6px;line-height:1.3;"
-            f"min-height:34px;display:flex;align-items:center;justify-content:center'>{h}</div>",
-            unsafe_allow_html=True)
-    st.divider()
+    # ── Load current week tasks ──
+    cache_key = f"task_cache_{selected_ws}"
+    if cache_key not in st.session_state:
+        wt    = get_tasks_for_week(str(ws))
+        cache = {p["id"]: {tc:"pending" for tc in TASK_COLS} for p in projects}
+        for t in wt:
+            pid,tc = t["project_id"], t["task_col"]
+            if pid in cache and tc in TASK_COLS:
+                cache[pid][tc] = t.get("status",
+                    "done" if t.get("checked") else "pending")
+        st.session_state[cache_key] = cache
+    cache = st.session_state[cache_key]
 
-    sr = 1
+    # ── Build editable dataframe ──
+    # Done cols = bool checkboxes, NA cols = bool checkboxes
+    DONE_COLS = [f"✅ {tc}" for tc in TASK_COLS]
+    NA_COLS   = [f"NA {tc}" for tc in TASK_COLS]
+
+    rows = []
     for p in filtered:
-        task_status = cache.get(p["id"], {tc:"pending" for tc in TASK_COLS})
-        applicable  = sum(1 for tc in TASK_COLS if task_status.get(tc,"pending") != "na")
-        scored      = sum(1 for tc in TASK_COLS if task_status.get(tc,"pending") == "done")
+        s = cache.get(p["id"], {tc:"pending" for tc in TASK_COLS})
+        row = {"_pid": p["id"], "_am1": p["am1"], "_am2": p["am2"],
+               "AM1": p["am1"], "AM2": p["am2"], "Project": p["name"]}
+        for tc, dc, nc in zip(TASK_COLS, DONE_COLS, NA_COLS):
+            row[dc] = (s.get(tc,"pending") == "done")
+            row[nc] = (s.get(tc,"pending") == "na")
+        applicable = sum(1 for tc in TASK_COLS if s.get(tc,"pending") != "na")
+        scored     = sum(1 for tc in TASK_COLS if s.get(tc,"pending") == "done")
+        row["Score"] = f"{scored}/{applicable}"
+        rows.append(row)
 
-        # ── Done row ──
-        row = st.columns(COLS)
-        row[0].markdown(f"<p class='row-text' style='text-align:center;padding-top:6px'>{sr}</p>",
-                        unsafe_allow_html=True)
-        row[1].markdown(f"<p class='row-text' style='padding-top:6px'>{p['am1']}</p>",
-                        unsafe_allow_html=True)
-        row[2].markdown(f"<p class='row-text' style='padding-top:6px'>{p['am2']}</p>",
-                        unsafe_allow_html=True)
-        row[3].markdown(f"<p class='row-bold' style='padding-top:6px'>{p['name']}</p>",
-                        unsafe_allow_html=True)
+    df = pd.DataFrame(rows)
 
-        for i, tc in enumerate(TASK_COLS):
-            cur   = task_status.get(tc, "pending")
-            is_na = (cur == "na")
-            if is_na:
-                row[4+i].markdown(
-                    "<div style='text-align:center;color:#818cf8;font-size:.75rem;"
-                    "font-weight:700;padding-top:8px'>N/A</div>",
-                    unsafe_allow_html=True)
-            else:
-                new_done = row[4+i].checkbox("Done", value=(cur=="done"),
-                                             key=f"done_{p['id']}_{tc}_{selected_ws}")
-                if new_done != (cur=="done"):
-                    new_status = "done" if new_done else "pending"
-                    # Update local cache immediately (no rerun needed)
-                    st.session_state[cache_key][p["id"]][tc] = new_status
-                    # Save to Supabase in background
-                    upsert_task(p["id"], p["am1"], p["am2"], tc, new_status, ws)
+    # Column config — show only done cols + na cols as checkboxes
+    col_cfg = {
+        "_pid":    st.column_config.Column(disabled=True, width=0),
+        "_am1":    st.column_config.Column(disabled=True, width=0),
+        "_am2":    st.column_config.Column(disabled=True, width=0),
+        "AM1":     st.column_config.TextColumn("AM1",    disabled=True, width="small"),
+        "AM2":     st.column_config.TextColumn("AM2",    disabled=True, width="small"),
+        "Project": st.column_config.TextColumn("Project",disabled=True, width="medium"),
+        "Score":   st.column_config.TextColumn("Score",  disabled=True, width="small"),
+    }
+    for dc in DONE_COLS:
+        col_cfg[dc] = st.column_config.CheckboxColumn(dc.replace("✅ ",""), width="small")
+    for nc in NA_COLS:
+        col_cfg[nc] = st.column_config.CheckboxColumn(nc.replace("NA ","N/A "), width="small")
 
-        sc_class = ("score-high" if scored==applicable and applicable>0
-                    else "score-0" if scored==0 else "score-low")
-        row[9].markdown(
-            f"<div style='padding-top:6px;text-align:center'>"
-            f"<span class='{sc_class}'>{scored}/{applicable}</span></div>",
-            unsafe_allow_html=True)
-
-        # ── NA row ──
-        na_row = st.columns(COLS)
-        na_row[3].markdown(
-            "<p style='font-size:.62rem;color:#94a3b8;text-align:right;"
-            "margin:0;padding-right:6px;padding-top:2px'>N/A →</p>",
-            unsafe_allow_html=True)
-        for i, tc in enumerate(TASK_COLS):
-            cur   = task_status.get(tc, "pending")
-            is_na = (cur == "na")
-            new_na = na_row[4+i].checkbox("N/A", value=is_na,
-                                          key=f"na_{p['id']}_{tc}_{selected_ws}")
-            if new_na != is_na:
-                new_status = "na" if new_na else "pending"
-                st.session_state[cache_key][p["id"]][tc] = new_status
-                upsert_task(p["id"], p["am1"], p["am2"], tc, new_status, ws)
-
-        st.markdown("<hr style='margin:.25rem 0;border-color:#f1f5f9'>",
-                    unsafe_allow_html=True)
-        sr += 1
-
-    st.markdown(f"<p style='color:#94a3b8;font-size:.78rem;margin-top:.5rem'>"
-                f"Showing {sr-1} of {len(projects)} projects · "
-                f"Auto-saved · Score = Done / Applicable (N/A excluded)</p>",
+    st.markdown("**✅ = Done &nbsp;|&nbsp; N/A = Not applicable (excluded from score)**",
                 unsafe_allow_html=True)
+
+    edited = st.data_editor(
+        df[["AM1","AM2","Project"]+DONE_COLS+NA_COLS+["Score"]],
+        column_config=col_cfg,
+        use_container_width=True,
+        hide_index=True,
+        key=f"de_{selected_ws}_{f_am1}_{f_am2}_{f_proj}",
+        num_rows="fixed",
+    )
+
+    # ── Save button — batch save all changes ──
+    if st.button("💾 Save Changes", type="primary", use_container_width=False):
+        with st.spinner("Saving..."):
+            for idx, erow in edited.iterrows():
+                orig_row = df.iloc[idx]
+                pid  = orig_row["_pid"]
+                am1  = orig_row["_am1"]
+                am2  = orig_row["_am2"]
+                for tc, dc, nc in zip(TASK_COLS, DONE_COLS, NA_COLS):
+                    is_na   = bool(erow[nc])
+                    is_done = bool(erow[dc]) and not is_na
+                    status  = "na" if is_na else ("done" if is_done else "pending")
+                    old_status = cache.get(pid,{}).get(tc,"pending")
+                    if status != old_status:
+                        upsert_task(pid, am1, am2, tc, status, ws)
+                        if pid not in st.session_state[cache_key]:
+                            st.session_state[cache_key][pid] = {}
+                        st.session_state[cache_key][pid][tc] = status
+        st.success("✅ Saved successfully!")
+        st.rerun()
+
+    st.caption(f"Showing {len(filtered)} of {len(projects)} projects · "
+               f"Score = Done / Applicable (N/A excluded)")
 
 
 

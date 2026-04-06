@@ -201,7 +201,7 @@ def generate_weekly_report(week_start_str):
         task_map = {}
         for t in wt:
             if t["project_id"] == p["id"]:
-                task_map[t["task_col"]] = t.get("status", "done" if t["checked"] else "pending")
+                task_map[t["task_col"]] = t.get("status", "done" if t.get("status","done" if t.get("checked") else "pending")=="done" else "pending")
         row = {"project_id":p["id"],"project_name":p["name"],"am1":p["am1"],"am2":p["am2"]}
         applicable = 0
         scored     = 0
@@ -242,7 +242,7 @@ def generate_monthly_report(year, month):
         total_applicable = 0
         for tc in TASK_COLS:
             proj_tasks = [t for t in mt if t["project_id"]==p["id"] and t["task_col"]==tc]
-            done  = sum(1 for t in proj_tasks if t.get("status","done" if t["checked"] else "pending")=="done")
+            done  = sum(1 for t in proj_tasks if t.get("status","done" if t.get("status","done" if t.get("checked") else "pending")=="done" else "pending")=="done")
             na    = sum(1 for t in proj_tasks if t.get("status","")=="na")
             applicable = len(weeks) - na
             row[tc] = done
@@ -536,6 +536,21 @@ def render_weekly_report(report, key_prefix="wr"):
     df = pd.DataFrame(rows)
     df["week_start"]  = report["week_start"]
     df["month_label"] = report.get("month_label","")
+
+    # Normalise task columns — old data has 0/1, new data has "done"/"na"/"pending"
+    for tc in TASK_COLS:
+        if tc in df.columns:
+            df[tc] = df[tc].apply(lambda v:
+                "done" if v in (1, True, "done") else
+                "na"   if v == "na" else "pending")
+
+    # Ensure score & applicable columns exist
+    if "score" not in df.columns:
+        df["score"] = df.apply(lambda r: sum(1 for tc in TASK_COLS if r.get(tc)=="done"), axis=1)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).astype(int)
+    if "applicable" not in df.columns:
+        df["applicable"] = df.apply(lambda r: sum(1 for tc in TASK_COLS if r.get(tc)!="na"), axis=1)
+
     st.markdown(f"#### 📅 {report['week_label']}")
     st.caption(f"Generated: {report['generated_at'][:19]}")
     fdf, sel = filter_bar(df, show_week=False, show_month=False,
@@ -543,17 +558,20 @@ def render_weekly_report(report, key_prefix="wr"):
                           key_prefix=key_prefix)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Points",        int(fdf["score"].sum()))
-    c2.metric("Projects Hit Target", len(fdf[fdf["score"]>=WEEKLY_TARGET]))
-    c3.metric("Zero-Score",          len(fdf[fdf["score"]==0]))
+    c2.metric("Projects Hit Target", int((fdf["score"] >= fdf["applicable"]).sum()))
+    c3.metric("Zero-Score",          int((fdf["score"]==0).sum()))
     c4.metric("Avg Score",           round(fdf["score"].mean(),1) if len(fdf) else 0)
+
     st.markdown("##### Pivot Table")
-    disp = fdf[["am1","am2","project_name"]+TASK_COLS+["score"]].copy()
+    disp = fdf[["am1","am2","project_name"]+TASK_COLS+["score","applicable"]].copy()
+    disp["Score"] = disp.apply(lambda r: f"{r['score']}/{r['applicable']}", axis=1)
+    disp = disp[["am1","am2","project_name"]+TASK_COLS+["Score"]]
     disp.columns = ["AM1","AM2","Project"]+TASK_COLS+["Score"]
     styled = (disp.style
-              .map(color_score_cell, subset=["Score"])
               .map(color_task_cell,  subset=TASK_COLS)
               .set_properties(**{"text-align":"center"}, subset=TASK_COLS+["Score"]))
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
     if sel["project"]=="All":
         st.markdown("##### AM2 Summary")
         am2s = fdf.groupby(["am1","am2"]).agg(
@@ -586,6 +604,17 @@ def render_monthly_report(report, key_prefix="mr"):
     if not rows: st.info("No data."); return
     df = pd.DataFrame(rows)
     df["month_label"] = report["month_label"]
+
+    # Ensure numeric columns
+    for col in ["total_score","completion_pct","max_possible"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # Normalise task columns to numeric done-count
+    for tc in TASK_COLS:
+        if tc in df.columns:
+            df[tc] = pd.to_numeric(df[tc], errors="coerce").fillna(0).astype(int)
+
     st.markdown(f"#### 📆 {report['month_label']}")
     st.caption(f"Weeks: {len(report['weeks'])} | Generated: {report['generated_at'][:19]}")
     fdf, sel = filter_bar(df, show_week=False, show_month=False,
@@ -593,8 +622,8 @@ def render_monthly_report(report, key_prefix="mr"):
                           key_prefix=key_prefix)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Points",        int(fdf["total_score"].sum()))
-    c2.metric("Projects Hit Target", len(fdf[fdf["completion_pct"]>=100]))
-    c3.metric("Zero-Score",          len(fdf[fdf["total_score"]==0]))
+    c2.metric("Projects Hit Target", int((fdf["completion_pct"]>=100).sum()))
+    c3.metric("Zero-Score",          int((fdf["total_score"]==0).sum()))
     c4.metric("Avg Completion",
               f"{round(fdf['completion_pct'].mean(),1)}%" if len(fdf) else "0%")
     st.markdown("##### Monthly Pivot Table")
@@ -652,13 +681,13 @@ def exec_overview():
     wt       = get_tasks_for_week(ws)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Projects",    len(projects))
-    c2.metric("Active This Week",  len({t["project_id"] for t in wt if t["checked"]}))
-    c3.metric("Tasks Checked Off", sum(1 for t in wt if t["checked"]))
+    c2.metric("Active This Week",  len({t["project_id"] for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"}))
+    c3.metric("Tasks Checked Off", sum(1 for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"))
     c4.metric("Zero-Score",
               sum(1 for p in projects
-                  if not any(t["project_id"]==p["id"] and t["checked"] for t in wt)))
+                  if not any(t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done" for t in wt)))
     rows = [{"am1":p["am1"],"am2":p["am2"],"project_name":p["name"],
-             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t["checked"])}
+             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done")}
             for p in projects]
     if rows:
         df = pd.DataFrame(rows)
@@ -724,7 +753,7 @@ def exec_mark_tasks():
         for t in wt:
             if t["project_id"] == p["id"]:
                 task_status[t["task_col"]] = t.get("status",
-                    "done" if t["checked"] else "pending")
+                    "done" if t.get("status","done" if t.get("checked") else "pending")=="done" else "pending")
 
         applicable = sum(1 for tc in TASK_COLS if task_status.get(tc, "pending") != "na")
         scored     = sum(1 for tc in TASK_COLS if task_status.get(tc, "pending") == "done")
@@ -839,13 +868,13 @@ def mgr_dashboard():
     wt       = get_tasks_for_week(ws)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Projects",   len(projects))
-    c2.metric("Active This Week", len({t["project_id"] for t in wt if t["checked"]}))
-    c3.metric("Total Points",     sum(1 for t in wt if t["checked"]))
+    c2.metric("Active This Week", len({t["project_id"] for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"}))
+    c3.metric("Total Points",     sum(1 for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"))
     c4.metric("Zero-Score",
               sum(1 for p in projects
-                  if not any(t["project_id"]==p["id"] and t["checked"] for t in wt)))
+                  if not any(t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done" for t in wt)))
     rows = [{"am1":p["am1"],"am2":p["am2"],"project_name":p["name"],
-             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t["checked"])}
+             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done")}
             for p in projects]
     if not rows: return
     df  = pd.DataFrame(rows)
@@ -1006,7 +1035,7 @@ def mgr_all_tasks():
             "am2":          t.get("am2",""),
             "project_name": p.get("name",""),
             "task_col":     t["task_col"],
-            "done":         "✅" if t["checked"] else "❌",
+            "done":         "✅" if t.get("status","done" if t.get("checked") else "pending")=="done" else ("➖" if t.get("status")=="na" else "❌"),
             "updated":      str(t.get("updated_at",""))[:16],
         })
     df=pd.DataFrame(rows).sort_values(["week_start","am1","am2"],ascending=[False,True,True])

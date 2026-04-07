@@ -118,42 +118,37 @@ def upsert_task(project_id, am1, am2, task_col, status, ws):
     ws_str  = str(ws)
     now     = str(datetime.now())
     checked = (status == "done")
-    # Single call — Supabase upserts on (project_id, week_start, task_col)
-    payload = {
-        "project_id":  project_id,
-        "am1":         am1,
-        "am2":         am2,
-        "task_col":    task_col,
-        "checked":     checked,
-        "status":      status,
-        "week_start":  ws_str,
-        "month_label": month_label(ws.year, ws.month),
-        "month":       ws.month,
-        "year":        ws.year,
-        "updated_at":  now,
-    }
-    # Try upsert first (requires unique constraint on project_id+week_start+task_col)
-    r = requests.post(
+
+    # Delete existing record for this project+week+task, then insert fresh
+    # This is the most reliable approach — no conflict issues
+    requests.delete(
         _url("tasks"),
-        headers={**_headers(),
-                 "Prefer": "resolution=merge-duplicates,return=minimal"},
-        params={"on_conflict": "project_id,week_start,task_col"},
-        json=[payload]
-    )
-    # If upsert fails (no unique constraint yet), fall back to select+update/insert
-    if r.status_code >= 400:
-        existing = db_select("tasks", {
+        headers=_headers(),
+        params={
             "project_id": f"eq.{project_id}",
-            "week_start": f"eq.{ws_str}",
-            "task_col":   f"eq.{task_col}"
-        })
-        if existing:
-            db_update("tasks", "id", existing[0]["id"],
-                      {"checked": checked, "status": status, "updated_at": now})
-        else:
-            payload["id"] = str(uuid.uuid4())
-            payload["created_at"] = now
-            db_insert("tasks", payload)
+            "week_start":  f"eq.{ws_str}",
+            "task_col":    f"eq.{task_col}",
+        }
+    )
+    requests.post(
+        _url("tasks"),
+        headers=_headers("return=minimal"),
+        json=[{
+            "id":          str(uuid.uuid4()),
+            "project_id":  project_id,
+            "am1":         am1,
+            "am2":         am2,
+            "task_col":    task_col,
+            "checked":     checked,
+            "status":      status,
+            "week_start":  ws_str,
+            "month_label": month_label(ws.year, ws.month),
+            "month":       ws.month,
+            "year":        ws.year,
+            "created_at":  now,
+            "updated_at":  now,
+        }]
+    )
 
 def get_weekly_reports():
     rows = db_select("weekly_reports", order="week_start.desc")
@@ -731,6 +726,15 @@ def exec_mark_tasks():
     if not projects: st.info("No projects yet."); return
 
     # ── Load tasks into session_state cache ──
+    cache_key = f"task_cache_{selected_ws}"
+    # ── Load from Supabase into session_state ──
+    # Clear old cache if week changed
+    if st.session_state.get("last_week") != selected_ws:
+        for k in list(st.session_state.keys()):
+            if k.startswith("task_cache_") or k.startswith("loaded_"):
+                del st.session_state[k]
+        st.session_state["last_week"] = selected_ws
+
     cache_key = f"task_cache_{selected_ws}"
     if cache_key not in st.session_state:
         wt    = get_tasks_for_week(str(ws))

@@ -119,36 +119,35 @@ def upsert_task(project_id, am1, am2, task_col, status, ws):
     now     = str(datetime.now())
     checked = (status == "done")
 
-    # Delete existing record for this project+week+task, then insert fresh
-    # This is the most reliable approach — no conflict issues
-    requests.delete(
-        _url("tasks"),
-        headers=_headers(),
-        params={
-            "project_id": f"eq.{project_id}",
-            "week_start":  f"eq.{ws_str}",
-            "task_col":    f"eq.{task_col}",
-        }
-    )
-    requests.post(
-        _url("tasks"),
-        headers=_headers("return=minimal"),
-        json=[{
+    # Check if row exists
+    existing = db_select("tasks", {
+        "project_id": f"eq.{project_id}",
+        "week_start": f"eq.{ws_str}",
+        "task_col":   f"eq.{task_col}",
+    })
+
+    if existing:
+        # Update all matching rows (in case of duplicates, update first)
+        for row in existing:
+            db_update("tasks", "id", row["id"],
+                      {"checked": checked, "status": status, "updated_at": now})
+        # Delete any extra duplicate rows
+        if len(existing) > 1:
+            for row in existing[1:]:
+                db_delete("tasks", "id", row["id"])
+    else:
+        db_insert("tasks", {
             "id":          str(uuid.uuid4()),
             "project_id":  project_id,
-            "am1":         am1,
-            "am2":         am2,
+            "am1":         am1, "am2": am2,
             "task_col":    task_col,
             "checked":     checked,
             "status":      status,
             "week_start":  ws_str,
             "month_label": month_label(ws.year, ws.month),
-            "month":       ws.month,
-            "year":        ws.year,
-            "created_at":  now,
-            "updated_at":  now,
-        }]
-    )
+            "month":       ws.month, "year": ws.year,
+            "created_at":  now, "updated_at": now,
+        })
 
 def get_weekly_reports():
     rows = db_select("weekly_reports", order="week_start.desc")
@@ -727,22 +726,29 @@ def exec_mark_tasks():
 
     # ── Load tasks into session_state cache ──
     cache_key = f"task_cache_{selected_ws}"
-    # ── Load from Supabase into session_state ──
-    # Clear old cache if week changed
+    # ── Always reload from Supabase fresh ──
+    cache_key = f"task_cache_{selected_ws}"
+    # Clear cache if week changed or not loaded yet
     if st.session_state.get("last_week") != selected_ws:
         for k in list(st.session_state.keys()):
-            if k.startswith("task_cache_") or k.startswith("loaded_"):
+            if k.startswith("task_cache_"):
                 del st.session_state[k]
         st.session_state["last_week"] = selected_ws
 
-    cache_key = f"task_cache_{selected_ws}"
     if cache_key not in st.session_state:
         wt    = get_tasks_for_week(str(ws))
         cache = {p["id"]: {tc: False for tc in TASK_COLS} for p in projects}
         for t in wt:
             pid, tc = t["project_id"], t["task_col"]
             if pid in cache and tc in TASK_COLS:
-                cache[pid][tc] = bool(t.get("checked") or t.get("status") == "done")
+                # Use status field if available, else fall back to checked bool
+                st_val = t.get("status", "")
+                if st_val == "done":
+                    cache[pid][tc] = True
+                elif st_val == "pending":
+                    cache[pid][tc] = False
+                else:
+                    cache[pid][tc] = bool(t.get("checked", False))
         st.session_state[cache_key] = cache
     cache = st.session_state[cache_key]
 

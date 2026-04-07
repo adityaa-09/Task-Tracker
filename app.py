@@ -106,7 +106,7 @@ def add_project(name, am1, am2):
     db_insert("projects", {"id": str(uuid.uuid4()), "name": name, "am1": am1, "am2": am2})
 
 def delete_project(pid):
-    db_delete("projects", "id", pid)
+    db_delete("projects", "id", f"eq.{pid}")
 
 def get_tasks_for_week(week_start):
     return db_select("tasks", {"week_start": f"eq.{week_start}"})
@@ -114,19 +114,18 @@ def get_tasks_for_week(week_start):
 def get_all_tasks():
     return db_select("tasks", order="week_start.desc")
 
-def upsert_task(project_id, am1, am2, task_col, status, ws):
-    # status: "done", "na", "pending"
+def upsert_task(project_id, am1, am2, task_col, checked, ws):
     ws_str = str(ws)
     now    = str(datetime.now())
-    checked = (status == "done")
+    # check if exists
     existing = db_select("tasks", {
         "project_id": f"eq.{project_id}",
         "week_start": f"eq.{ws_str}",
         "task_col":   f"eq.{task_col}"
     })
     if existing:
-        db_update("tasks", "id", existing[0]['id'],
-                  {"checked": checked, "status": status, "updated_at": now})
+        db_update("tasks", "id", f"eq.{existing[0]['id']}",
+                  {"checked": checked, "updated_at": now})
     else:
         db_insert("tasks", {
             "id": str(uuid.uuid4()),
@@ -134,7 +133,6 @@ def upsert_task(project_id, am1, am2, task_col, status, ws):
             "am1": am1, "am2": am2,
             "task_col": task_col,
             "checked":  checked,
-            "status":   status,
             "week_start": ws_str,
             "month_label": month_label(ws.year, ws.month),
             "month": ws.month, "year": ws.year,
@@ -198,23 +196,10 @@ def generate_weekly_report(week_start_str):
     wt       = get_tasks_for_week(week_start_str)
     rows = []
     for p in projects:
-        task_map = {}
-        for t in wt:
-            if t["project_id"] == p["id"]:
-                task_map[t["task_col"]] = t.get("status", "done" if t.get("status","done" if t.get("checked") else "pending")=="done" else "pending")
+        task_map = {t["task_col"]: int(t["checked"]) for t in wt if t["project_id"]==p["id"]}
         row = {"project_id":p["id"],"project_name":p["name"],"am1":p["am1"],"am2":p["am2"]}
-        applicable = 0
-        scored     = 0
-        for tc in TASK_COLS:
-            st_val = task_map.get(tc, "pending")
-            row[tc] = st_val
-            if st_val != "na":
-                applicable += 1
-                if st_val == "done":
-                    scored += 1
-        row["score"]       = scored
-        row["applicable"]  = applicable
-        row["max_possible"]= applicable
+        for tc in TASK_COLS: row[tc] = task_map.get(tc, 0)
+        row["score"] = sum(row[tc] for tc in TASK_COLS)
         rows.append(row)
     ws = date.fromisoformat(week_start_str)
     report = {
@@ -238,21 +223,14 @@ def generate_monthly_report(year, month):
     rows = []
     for p in projects:
         row = {"project_id":p["id"],"project_name":p["name"],"am1":p["am1"],"am2":p["am2"]}
-        total_scored = 0
-        total_applicable = 0
         for tc in TASK_COLS:
-            proj_tasks = [t for t in mt if t["project_id"]==p["id"] and t["task_col"]==tc]
-            done  = sum(1 for t in proj_tasks if t.get("status","done" if t.get("status","done" if t.get("checked") else "pending")=="done" else "pending")=="done")
-            na    = sum(1 for t in proj_tasks if t.get("status","")=="na")
-            applicable = len(weeks) - na
-            row[tc] = done
-            total_scored     += done
-            total_applicable += max(applicable, 0)
-        row["total_score"]    = total_scored
+            row[tc] = sum(1 for t in mt
+                          if t["project_id"]==p["id"] and t["task_col"]==tc and t["checked"])
+        row["total_score"]    = sum(row[tc] for tc in TASK_COLS)
         row["weeks_tracked"]  = len(weeks)
-        row["max_possible"]   = total_applicable
-        row["completion_pct"] = round(total_scored/total_applicable*100,1) \
-                                if total_applicable else 0
+        row["max_possible"]   = len(weeks) * WEEKLY_TARGET
+        row["completion_pct"] = round(row["total_score"]/row["max_possible"]*100,1) \
+                                if row["max_possible"] else 0
         rows.append(row)
     report = {
         "id":          str(uuid.uuid4()),
@@ -470,10 +448,9 @@ def color_score_cell(val):
     else:       return "color:#166534;font-weight:800;background-color:#f0fdf4;text-align:center;"
 
 def color_task_cell(val):
-    if val == "done" or val == 1:  return "color:#166534;font-weight:600;background-color:#f0fdf4;"
-    if val == "na":                return "color:#6366f1;font-weight:600;background-color:#eef2ff;"
-    if val == "pending" or val == 0: return "color:#94a3b8;background-color:#f8fafc;"
-    return ""
+    if not isinstance(val,(int,float)): return ""
+    return ("color:#166534;font-weight:600;background-color:#f0fdf4;" if val==1
+            else "color:#94a3b8;background-color:#f8fafc;")
 
 def color_pct_cell(val):
     if not isinstance(val,(int,float)): return ""
@@ -536,21 +513,6 @@ def render_weekly_report(report, key_prefix="wr"):
     df = pd.DataFrame(rows)
     df["week_start"]  = report["week_start"]
     df["month_label"] = report.get("month_label","")
-
-    # Normalise task columns — old data has 0/1, new data has "done"/"na"/"pending"
-    for tc in TASK_COLS:
-        if tc in df.columns:
-            df[tc] = df[tc].apply(lambda v:
-                "done" if v in (1, True, "done") else
-                "na"   if v == "na" else "pending")
-
-    # Ensure score & applicable columns exist
-    if "score" not in df.columns:
-        df["score"] = df.apply(lambda r: sum(1 for tc in TASK_COLS if r.get(tc)=="done"), axis=1)
-    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0).astype(int)
-    if "applicable" not in df.columns:
-        df["applicable"] = df.apply(lambda r: sum(1 for tc in TASK_COLS if r.get(tc)!="na"), axis=1)
-
     st.markdown(f"#### 📅 {report['week_label']}")
     st.caption(f"Generated: {report['generated_at'][:19]}")
     fdf, sel = filter_bar(df, show_week=False, show_month=False,
@@ -558,20 +520,17 @@ def render_weekly_report(report, key_prefix="wr"):
                           key_prefix=key_prefix)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Points",        int(fdf["score"].sum()))
-    c2.metric("Projects Hit Target", int((fdf["score"] >= fdf["applicable"]).sum()))
-    c3.metric("Zero-Score",          int((fdf["score"]==0).sum()))
+    c2.metric("Projects Hit Target", len(fdf[fdf["score"]>=WEEKLY_TARGET]))
+    c3.metric("Zero-Score",          len(fdf[fdf["score"]==0]))
     c4.metric("Avg Score",           round(fdf["score"].mean(),1) if len(fdf) else 0)
-
     st.markdown("##### Pivot Table")
-    disp = fdf[["am1","am2","project_name"]+TASK_COLS+["score","applicable"]].copy()
-    disp["Score"] = disp.apply(lambda r: f"{r['score']}/{r['applicable']}", axis=1)
-    disp = disp[["am1","am2","project_name"]+TASK_COLS+["Score"]]
+    disp = fdf[["am1","am2","project_name"]+TASK_COLS+["score"]].copy()
     disp.columns = ["AM1","AM2","Project"]+TASK_COLS+["Score"]
     styled = (disp.style
-              .map(color_task_cell,  subset=TASK_COLS)
+              .applymap(color_score_cell, subset=["Score"])
+              .applymap(color_task_cell,  subset=TASK_COLS)
               .set_properties(**{"text-align":"center"}, subset=TASK_COLS+["Score"]))
     st.dataframe(styled, use_container_width=True, hide_index=True)
-
     if sel["project"]=="All":
         st.markdown("##### AM2 Summary")
         am2s = fdf.groupby(["am1","am2"]).agg(
@@ -604,17 +563,6 @@ def render_monthly_report(report, key_prefix="mr"):
     if not rows: st.info("No data."); return
     df = pd.DataFrame(rows)
     df["month_label"] = report["month_label"]
-
-    # Ensure numeric columns
-    for col in ["total_score","completion_pct","max_possible"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    # Normalise task columns to numeric done-count
-    for tc in TASK_COLS:
-        if tc in df.columns:
-            df[tc] = pd.to_numeric(df[tc], errors="coerce").fillna(0).astype(int)
-
     st.markdown(f"#### 📆 {report['month_label']}")
     st.caption(f"Weeks: {len(report['weeks'])} | Generated: {report['generated_at'][:19]}")
     fdf, sel = filter_bar(df, show_week=False, show_month=False,
@@ -622,17 +570,17 @@ def render_monthly_report(report, key_prefix="mr"):
                           key_prefix=key_prefix)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Points",        int(fdf["total_score"].sum()))
-    c2.metric("Projects Hit Target", int((fdf["completion_pct"]>=100).sum()))
-    c3.metric("Zero-Score",          int((fdf["total_score"]==0).sum()))
+    c2.metric("Projects Hit Target", len(fdf[fdf["completion_pct"]>=100]))
+    c3.metric("Zero-Score",          len(fdf[fdf["total_score"]==0]))
     c4.metric("Avg Completion",
               f"{round(fdf['completion_pct'].mean(),1)}%" if len(fdf) else "0%")
     st.markdown("##### Monthly Pivot Table")
     disp = fdf[["am1","am2","project_name"]+TASK_COLS+["total_score","completion_pct"]].copy()
     disp.columns = ["AM1","AM2","Project"]+TASK_COLS+["Total Score","Completion %"]
     styled = (disp.style
-              .map(color_score_cell, subset=["Total Score"])
-              .map(color_pct_cell,   subset=["Completion %"])
-              .map(color_task_cell,  subset=TASK_COLS)
+              .applymap(color_score_cell, subset=["Total Score"])
+              .applymap(color_pct_cell,   subset=["Completion %"])
+              .applymap(color_task_cell,  subset=TASK_COLS)
               .set_properties(**{"text-align":"center"},
                               subset=TASK_COLS+["Total Score","Completion %"]))
     st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -681,13 +629,13 @@ def exec_overview():
     wt       = get_tasks_for_week(ws)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Projects",    len(projects))
-    c2.metric("Active This Week",  len({t["project_id"] for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"}))
-    c3.metric("Tasks Checked Off", sum(1 for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"))
+    c2.metric("Active This Week",  len({t["project_id"] for t in wt if t["checked"]}))
+    c3.metric("Tasks Checked Off", sum(1 for t in wt if t["checked"]))
     c4.metric("Zero-Score",
               sum(1 for p in projects
-                  if not any(t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done" for t in wt)))
+                  if not any(t["project_id"]==p["id"] and t["checked"] for t in wt)))
     rows = [{"am1":p["am1"],"am2":p["am2"],"project_name":p["name"],
-             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done")}
+             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t["checked"])}
             for p in projects]
     if rows:
         df = pd.DataFrame(rows)
@@ -696,60 +644,39 @@ def exec_overview():
                            key_prefix="ov_exec")
         disp = fdf[["am1","am2","project_name","score"]].copy()
         disp.columns = ["AM1","AM2","Project","Score"]
-        st.dataframe(disp.style.map(color_score_cell, subset=["Score"]),
+        st.dataframe(disp.style.applymap(color_score_cell, subset=["Score"]),
                      use_container_width=True, hide_index=True)
 
 
 def exec_mark_tasks():
-    # ── Week selector ──
-    today        = date.today()
-    week_options = [str(get_week_start(today - timedelta(weeks=i))) for i in range(8)]
-    selected_ws  = st.selectbox("📅 Select Week", week_options,
-                                format_func=lambda w: week_label(w) + (" · Current" if w==week_options[0] else ""),
-                                key="mt_week")
-    ws = date.fromisoformat(selected_ws)
-
     st.markdown(f'<div class="ph"><h1>✅ Mark Weekly Tasks</h1>'
-                f'<p>{week_label(ws)} · Tick each completed activity</p></div>',
+                f'<p>{week_label(get_week_start())} · Tick each completed activity</p></div>',
                 unsafe_allow_html=True)
-
     projects = get_projects()
     if not projects: st.info("No projects yet."); return
-
-    # ── Load tasks into session_state cache ──
-    cache_key = f"task_cache_{selected_ws}"
-    if cache_key not in st.session_state:
-        wt    = get_tasks_for_week(str(ws))
-        cache = {p["id"]: {tc: False for tc in TASK_COLS} for p in projects}
-        for t in wt:
-            pid, tc = t["project_id"], t["task_col"]
-            if pid in cache and tc in TASK_COLS:
-                cache[pid][tc] = bool(t.get("checked") or t.get("status") == "done")
-        st.session_state[cache_key] = cache
-    cache = st.session_state[cache_key]
-
-    # ── Filters ──
+    ws  = get_week_start()
+    wt  = get_tasks_for_week(str(ws))
     all_am1 = sorted({p["am1"] for p in projects})
     c1,c2,c3 = st.columns(3)
-    f_am1 = c1.selectbox("Filter AM1", ["All"]+all_am1, key="mt_am1")
+    f_am1 = c1.selectbox("Filter AM1",["All"]+all_am1, key="mt_am1")
     f_am2 = c2.selectbox("Filter AM2",
                          ["All"]+sorted({p["am2"] for p in projects
-                                         if f_am1=="All" or p["am1"]==f_am1}), key="mt_am2")
+                                         if f_am1=="All" or p["am1"]==f_am1}),
+                         key="mt_am2")
     f_proj_names = sorted({p["name"] for p in projects
                            if (f_am1=="All" or p["am1"]==f_am1)
                            and (f_am2=="All" or p["am2"]==f_am2)})
-    f_proj = c3.selectbox("Filter Project", ["All"]+f_proj_names, key="mt_proj")
+    f_proj = c3.selectbox("Filter Project",["All"]+f_proj_names, key="mt_proj")
     filtered = [p for p in projects
                 if (f_am1=="All" or p["am1"]==f_am1)
                 and (f_am2=="All" or p["am2"]==f_am2)
                 and (f_proj=="All" or p["name"]==f_proj)]
 
-    # ── Header row ──
-    COLS = [0.3, 1.2, 1.2, 2.4, 0.9, 0.9, 1.0, 0.9, 0.9, 0.65]
-    HDR  = ["Sr.", "AM1", "AM2", "Project",
-            "Review\nMtg", "PPC\nMtg", "Presales\nRev", "Mtg\nCP Agg", "MOM\nNurt.", "Score"]
+    SHORT_HEADERS = ["Sr.","AM1","AM2","Project","Review\nMtg","PPC\nMtg",
+                     "Presales\nRev","Mtg\nCP Agg","MOM\nNurt.","Score"]
+    COLS = [0.3,1.2,1.2,2.4,0.9,0.9,1.0,0.9,0.9,0.65]
     hrow = st.columns(COLS)
-    for col, h in zip(hrow, HDR):
+    for col,h in zip(hrow, SHORT_HEADERS):
         col.markdown(
             f"<div style='background:#1e3a5f;color:white;font-weight:700;font-size:.7rem;"
             f"text-align:center;padding:6px 2px;border-radius:6px;line-height:1.3;"
@@ -757,35 +684,28 @@ def exec_mark_tasks():
             unsafe_allow_html=True)
     st.divider()
 
-    sr = 1
+    sr=1; changed=False
     for p in filtered:
-        task_vals = cache.get(p["id"], {tc: False for tc in TASK_COLS})
-        score     = sum(1 for tc in TASK_COLS if task_vals.get(tc, False))
-
-        row = st.columns(COLS)
+        existing = {t["task_col"]:t["checked"] for t in wt if t["project_id"]==p["id"]}
+        score    = sum(existing.values())
+        row      = st.columns(COLS)
         row[0].markdown(f"<p class='row-text' style='text-align:center'>{sr}</p>",
                         unsafe_allow_html=True)
         row[1].markdown(f"<p class='row-text'>{p['am1']}</p>", unsafe_allow_html=True)
         row[2].markdown(f"<p class='row-text'>{p['am2']}</p>", unsafe_allow_html=True)
         row[3].markdown(f"<p class='row-bold'>{p['name']}</p>", unsafe_allow_html=True)
-
-        for i, tc in enumerate(TASK_COLS):
-            cur     = task_vals.get(tc, False)
-            new_val = row[4+i].checkbox("", value=cur,
-                                        key=f"cb_{p['id']}_{tc}_{selected_ws}")
+        for i,tc in enumerate(TASK_COLS):
+            cur     = existing.get(tc, False)
+            new_val = row[4+i].checkbox("", value=cur, key=f"cb_{p['id']}_{tc}")
             if new_val != cur:
-                st.session_state[cache_key][p["id"]][tc] = new_val
-                upsert_task(p["id"], p["am1"], p["am2"], tc,
-                            "done" if new_val else "pending", ws)
-
+                upsert_task(p["id"], p["am1"], p["am2"], tc, new_val, ws)
+                changed = True
         row[9].markdown(score_html(score), unsafe_allow_html=True)
         sr += 1
-
+    if changed: st.rerun()
     st.markdown(f"<p style='color:#94a3b8;font-size:.8rem;margin-top:.5rem'>"
                 f"Showing {sr-1} of {len(projects)} projects · auto-saved</p>",
                 unsafe_allow_html=True)
-
-
 
 
 def exec_weekly_page():
@@ -834,13 +754,13 @@ def mgr_dashboard():
     wt       = get_tasks_for_week(ws)
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Total Projects",   len(projects))
-    c2.metric("Active This Week", len({t["project_id"] for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"}))
-    c3.metric("Total Points",     sum(1 for t in wt if t.get("status","done" if t.get("checked") else "pending")=="done"))
+    c2.metric("Active This Week", len({t["project_id"] for t in wt if t["checked"]}))
+    c3.metric("Total Points",     sum(1 for t in wt if t["checked"]))
     c4.metric("Zero-Score",
               sum(1 for p in projects
-                  if not any(t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done" for t in wt)))
+                  if not any(t["project_id"]==p["id"] and t["checked"] for t in wt)))
     rows = [{"am1":p["am1"],"am2":p["am2"],"project_name":p["name"],
-             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t.get("status","done" if t.get("checked") else "pending")=="done")}
+             "score":sum(1 for t in wt if t["project_id"]==p["id"] and t["checked"])}
             for p in projects]
     if not rows: return
     df  = pd.DataFrame(rows)
@@ -934,8 +854,8 @@ def mgr_report_history():
                         disp = sub[["am1","am2","project_name"]+TASK_COLS+["score"]].copy()
                         disp.columns = ["AM1","AM2","Project"]+TASK_COLS+["Score"]
                         styled=(disp.style
-                                .map(color_score_cell, subset=["Score"])
-                                .map(color_task_cell,  subset=TASK_COLS)
+                                .applymap(color_score_cell, subset=["Score"])
+                                .applymap(color_task_cell,  subset=TASK_COLS)
                                 .set_properties(**{"text-align":"center"},subset=TASK_COLS+["Score"]))
                         st.dataframe(styled, use_container_width=True, hide_index=True)
                         c1,c2=st.columns(2)
@@ -968,9 +888,9 @@ def mgr_report_history():
                                  ["total_score","completion_pct"]].copy()
                         disp.columns=["AM1","AM2","Project"]+TASK_COLS+["Total","Completion %"]
                         styled=(disp.style
-                                .map(color_score_cell,subset=["Total"])
-                                .map(color_pct_cell,  subset=["Completion %"])
-                                .map(color_task_cell, subset=TASK_COLS)
+                                .applymap(color_score_cell,subset=["Total"])
+                                .applymap(color_pct_cell,  subset=["Completion %"])
+                                .applymap(color_task_cell, subset=TASK_COLS)
                                 .set_properties(**{"text-align":"center"},
                                                 subset=TASK_COLS+["Total","Completion %"]))
                         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -1001,7 +921,7 @@ def mgr_all_tasks():
             "am2":          t.get("am2",""),
             "project_name": p.get("name",""),
             "task_col":     t["task_col"],
-            "done":         "✅" if t.get("status","done" if t.get("checked") else "pending")=="done" else ("➖" if t.get("status")=="na" else "❌"),
+            "done":         "✅" if t["checked"] else "❌",
             "updated":      str(t.get("updated_at",""))[:16],
         })
     df=pd.DataFrame(rows).sort_values(["week_start","am1","am2"],ascending=[False,True,True])
@@ -1080,7 +1000,7 @@ def mgr_manage():
             opts={p["name"]:p["id"] for p in projects}
             del_n=st.selectbox("Select to remove",list(opts.keys()),key="del_p")
             if st.button("🗑️ Delete",type="secondary"):
-                db_delete("projects","id", opts[del_n])
+                db_delete("projects","id",f"eq.{opts[del_n]}")
                 st.success("Deleted."); st.rerun()
 
         if projects:
@@ -1120,7 +1040,7 @@ def mgr_manage():
                     if not new_pname or not am1f or not am2f:
                         st.error("All fields required")
                     else:
-                        db_update("projects", "id", sel_proj['id'],
+                        db_update("projects", "id", f"eq.{sel_proj['id']}",
                                   {"name": new_pname, "am1": am1f, "am2": am2f})
                         st.success(f"✅ '{new_pname}' updated!"); st.rerun()
 

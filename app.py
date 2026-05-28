@@ -14,8 +14,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="AM Task Tracker", page_icon="📊", layout="wide")
 
-TASK_COLS     = ["Review Meeting", "PPC Meeting", "Presales Review", "Meeting CP Agg", "MOM Nurturing"]
-WEEKLY_TARGET = 5
+DEFAULT_TASK_COLS = ["Review Meeting", "PPC Meeting", "Presales Review", "Meeting CP Agg", "MOM Nurturing"]
+WEEKLY_TARGET     = 5
+TASK_COLS         = DEFAULT_TASK_COLS  # overridden at runtime from DB
 
 # ─────────────────────────────────────────────────────────
 #  SUPABASE REST API  (uses requests — no supabase package)
@@ -63,6 +64,29 @@ def db_upsert(table, data, on_conflict):
                       params={"on_conflict": on_conflict},
                       json=data if isinstance(data, list) else [data])
     return r.json()
+
+# ── SETTINGS (task cols stored in DB) ──
+def get_task_cols():
+    rows = db_select("settings", {"key": "eq.task_cols"})
+    if rows and rows[0].get("value"):
+        try:
+            cols = json.loads(rows[0]["value"])
+            if isinstance(cols, list) and cols:
+                return cols
+        except Exception:
+            pass
+    return DEFAULT_TASK_COLS
+
+def save_task_cols(cols):
+    existing = db_select("settings", {"key": "eq.task_cols"})
+    if existing:
+        db_update("settings", "key", "eq.task_cols", {"value": json.dumps(cols)})
+    else:
+        db_insert("settings", {"key": "task_cols", "value": json.dumps(cols)})
+
+@st.cache_data(ttl=60)
+def get_task_cols_cached():
+    return get_task_cols()
 
 # ─────────────────────────────────────────────────────────
 #  DATE HELPERS
@@ -1050,7 +1074,7 @@ def mgr_all_tasks():
 
 def mgr_manage():
     st.markdown('<div class="ph"><h1>⚙️ Manage</h1></div>', unsafe_allow_html=True)
-    tab1,tab2 = st.tabs(["👤 Users","🏗️ Projects"])
+    tab1, tab2, tab3 = st.tabs(["👤 Users", "🏗️ Projects", "📋 Weekly Tasks"])
     with tab1:
         users=get_users()
         rc_map={"manager":"#3b82f6","executive":"#8b5cf6"}
@@ -1151,6 +1175,72 @@ def mgr_manage():
                                   {"name": new_pname, "am1": am1f, "am2": am2f})
                         st.success(f"✅ '{new_pname}' updated!"); st.rerun()
 
+    with tab3:
+        st.markdown("### 📋 Weekly Task List")
+        st.caption("Add, rename or remove the weekly tasks that appear in the Mark Tasks page.")
+
+        current_cols = get_task_cols()
+
+        st.markdown("#### Current Tasks")
+        for i, tc in enumerate(current_cols):
+            c1, c2, c3 = st.columns([3, 1, 1])
+            c1.markdown(f"**{i+1}. {tc}**")
+
+            # Rename
+            new_name = c2.text_input("", value=tc, key=f"rename_{i}",
+                                     label_visibility="collapsed")
+            if c2.button("✏️ Rename", key=f"ren_btn_{i}"):
+                if new_name.strip() and new_name.strip() != tc:
+                    updated = current_cols.copy()
+                    updated[i] = new_name.strip()
+                    save_task_cols(updated)
+                    get_task_cols_cached.clear()
+                    st.success(f"Renamed to '{new_name.strip()}'")
+                    st.rerun()
+
+            # Delete (only if more than 1 task)
+            if len(current_cols) > 1:
+                if c3.button("🗑️ Delete", key=f"del_tc_{i}"):
+                    updated = [t for j, t in enumerate(current_cols) if j != i]
+                    save_task_cols(updated)
+                    get_task_cols_cached.clear()
+                    st.success(f"Deleted '{tc}'")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### ➕ Add New Task")
+        with st.form("add_task_form"):
+            new_task = st.text_input("Task Name",
+                                     placeholder="e.g. Site Visit, Follow Up Call")
+            if st.form_submit_button("Add Task", type="primary"):
+                if not new_task.strip():
+                    st.error("Task name cannot be empty")
+                elif new_task.strip() in current_cols:
+                    st.error("Task already exists")
+                else:
+                    updated = current_cols + [new_task.strip()]
+                    save_task_cols(updated)
+                    get_task_cols_cached.clear()
+                    st.success(f"✅ '{new_task.strip()}' added!")
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### 🔀 Reorder Tasks")
+        st.caption("Change the order tasks appear in Mark Tasks page.")
+        with st.form("reorder_form"):
+            ordered = []
+            for i, tc in enumerate(current_cols):
+                new_pos = st.number_input(f"{tc}", min_value=1,
+                                          max_value=len(current_cols),
+                                          value=i+1, key=f"order_{i}")
+                ordered.append((new_pos, tc))
+            if st.form_submit_button("💾 Save Order"):
+                reordered = [tc for _, tc in sorted(ordered, key=lambda x: x[0])]
+                save_task_cols(reordered)
+                get_task_cols_cached.clear()
+                st.success("Order saved!")
+                st.rerun()
+
 # ─────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────
@@ -1163,6 +1253,11 @@ def main():
 
     if not st.session_state.get("logged_in"):
         login(); return
+
+    # ── Load dynamic task columns globally ──
+    global TASK_COLS, WEEKLY_TARGET
+    TASK_COLS     = get_task_cols_cached()
+    WEEKLY_TARGET = len(TASK_COLS)
 
     role = st.session_state["role"]
     page = sidebar(role)

@@ -78,11 +78,8 @@ def get_task_cols():
     return DEFAULT_TASK_COLS
 
 def save_task_cols(cols):
-    existing = db_select("settings", {"key": "eq.task_cols"})
-    if existing:
-        db_update("settings", "key", "eq.task_cols", {"value": json.dumps(cols)})
-    else:
-        db_insert("settings", {"key": "task_cols", "value": json.dumps(cols)})
+    # Use upsert on primary key 'key' — most reliable approach
+    db_upsert("settings", {"key": "task_cols", "value": json.dumps(cols)}, "key")
 
 @st.cache_data(ttl=60)
 def get_task_cols_cached():
@@ -1177,42 +1174,22 @@ def mgr_manage():
 
     with tab3:
         st.markdown("### 📋 Weekly Task List")
-        st.caption("Add, rename or remove the weekly tasks that appear in the Mark Tasks page.")
+        st.caption("Add, rename or remove the weekly tasks shown in Mark Tasks page.")
 
         current_cols = get_task_cols()
 
+        # ── Current tasks ──
         st.markdown("#### Current Tasks")
         for i, tc in enumerate(current_cols):
-            c1, c2, c3 = st.columns([3, 1, 1])
-            c1.markdown(f"**{i+1}. {tc}**")
+            st.markdown(f"**{i+1}.** {tc}")
+        st.divider()
 
-            # Rename
-            new_name = c2.text_input("", value=tc, key=f"rename_{i}",
-                                     label_visibility="collapsed")
-            if c2.button("✏️ Rename", key=f"ren_btn_{i}"):
-                if new_name.strip() and new_name.strip() != tc:
-                    updated = current_cols.copy()
-                    updated[i] = new_name.strip()
-                    save_task_cols(updated)
-                    get_task_cols_cached.clear()
-                    st.success(f"Renamed to '{new_name.strip()}'")
-                    st.rerun()
-
-            # Delete (only if more than 1 task)
-            if len(current_cols) > 1:
-                if c3.button("🗑️ Delete", key=f"del_tc_{i}"):
-                    updated = [t for j, t in enumerate(current_cols) if j != i]
-                    save_task_cols(updated)
-                    get_task_cols_cached.clear()
-                    st.success(f"Deleted '{tc}'")
-                    st.rerun()
-
-        st.markdown("---")
+        # ── Add task ──
         st.markdown("#### ➕ Add New Task")
         with st.form("add_task_form"):
             new_task = st.text_input("Task Name",
                                      placeholder="e.g. Site Visit, Follow Up Call")
-            if st.form_submit_button("Add Task", type="primary"):
+            if st.form_submit_button("➕ Add Task", type="primary"):
                 if not new_task.strip():
                     st.error("Task name cannot be empty")
                 elif new_task.strip() in current_cols:
@@ -1221,24 +1198,65 @@ def mgr_manage():
                     updated = current_cols + [new_task.strip()]
                     save_task_cols(updated)
                     get_task_cols_cached.clear()
-                    st.success(f"✅ '{new_task.strip()}' added!")
+                    st.success(f"✅ '{new_task.strip()}' added! Refresh page to see it in Mark Tasks.")
                     st.rerun()
 
-        st.markdown("---")
+        st.divider()
+
+        # ── Rename task ──
+        st.markdown("#### ✏️ Rename Task")
+        with st.form("rename_task_form"):
+            task_to_rename = st.selectbox("Select task to rename", current_cols,
+                                          key="rename_sel")
+            new_name = st.text_input("New Name")
+            if st.form_submit_button("✏️ Rename", type="primary"):
+                if not new_name.strip():
+                    st.error("New name cannot be empty")
+                elif new_name.strip() in current_cols:
+                    st.error("That name already exists")
+                else:
+                    updated = [new_name.strip() if t == task_to_rename else t
+                               for t in current_cols]
+                    save_task_cols(updated)
+                    get_task_cols_cached.clear()
+                    st.success(f"✅ Renamed to '{new_name.strip()}'!")
+                    st.rerun()
+
+        st.divider()
+
+        # ── Delete task ──
+        st.markdown("#### 🗑️ Delete Task")
+        with st.form("delete_task_form"):
+            task_to_del = st.selectbox("Select task to delete", current_cols,
+                                       key="delete_sel")
+            st.warning(f"This will remove **{task_to_del}** from all future weeks.")
+            if st.form_submit_button("🗑️ Delete Task", type="secondary"):
+                if len(current_cols) <= 1:
+                    st.error("Must have at least 1 task")
+                else:
+                    updated = [t for t in current_cols if t != task_to_del]
+                    save_task_cols(updated)
+                    get_task_cols_cached.clear()
+                    st.success(f"✅ Deleted '{task_to_del}'!")
+                    st.rerun()
+
+        st.divider()
+
+        # ── Reorder ──
         st.markdown("#### 🔀 Reorder Tasks")
-        st.caption("Change the order tasks appear in Mark Tasks page.")
         with st.form("reorder_form"):
+            st.caption("Set the position number for each task (1 = first)")
             ordered = []
             for i, tc in enumerate(current_cols):
-                new_pos = st.number_input(f"{tc}", min_value=1,
-                                          max_value=len(current_cols),
-                                          value=i+1, key=f"order_{i}")
-                ordered.append((new_pos, tc))
+                pos = st.number_input(tc, min_value=1,
+                                      max_value=len(current_cols),
+                                      value=i+1, key=f"order_{i}")
+                ordered.append((pos, tc))
             if st.form_submit_button("💾 Save Order"):
                 reordered = [tc for _, tc in sorted(ordered, key=lambda x: x[0])]
                 save_task_cols(reordered)
                 get_task_cols_cached.clear()
-                st.success("Order saved!")
+                st.success("✅ Order saved!")
                 st.rerun()
 
 # ─────────────────────────────────────────────────────────

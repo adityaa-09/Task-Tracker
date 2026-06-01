@@ -67,22 +67,31 @@ def db_upsert(table, data, on_conflict):
 
 # ── SETTINGS (task cols stored in DB) ──
 def get_task_cols():
-    rows = db_select("settings", {"key": "eq.task_cols"})
-    if rows and rows[0].get("value"):
-        try:
+    try:
+        r = requests.get(
+            _url("settings"),
+            headers=_headers(),
+            params={"key": "eq.task_cols", "select": "*"}
+        )
+        rows = r.json() if r.status_code == 200 else []
+        if rows and rows[0].get("value"):
             cols = json.loads(rows[0]["value"])
             if isinstance(cols, list) and cols:
                 return cols
-        except Exception:
-            pass
+    except Exception:
+        pass
     return DEFAULT_TASK_COLS
 
 def save_task_cols(cols):
-    # Use upsert on primary key 'key' — most reliable approach
-    db_upsert("settings", {"key": "task_cols", "value": json.dumps(cols)}, "key")
+    requests.post(
+        _url("settings"),
+        headers={**_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+        params={"on_conflict": "key"},
+        json=[{"key": "task_cols", "value": json.dumps(cols)}]
+    )
 
-@st.cache_data(ttl=60)
 def get_task_cols_cached():
+    # No caching — always read fresh from DB (settings change rarely)
     return get_task_cols()
 
 # ─────────────────────────────────────────────────────────
@@ -1195,11 +1204,23 @@ def mgr_manage():
                 elif new_task.strip() in current_cols:
                     st.error("Task already exists")
                 else:
-                    updated = current_cols + [new_task.strip()]
-                    save_task_cols(updated)
-                    get_task_cols_cached.clear()
-                    st.success(f"✅ '{new_task.strip()}' added! Refresh page to see it in Mark Tasks.")
-                    st.rerun()
+                    try:
+                        updated = current_cols + [new_task.strip()]
+                        # Direct upsert to settings table
+                        r = requests.post(
+                            _url("settings"),
+                            headers={**_headers(),
+                                     "Prefer": "resolution=merge-duplicates,return=representation"},
+                            params={"on_conflict": "key"},
+                            json=[{"key": "task_cols", "value": json.dumps(updated)}]
+                        )
+                        if r.status_code in (200, 201):
+                            st.success(f"✅ '{new_task.strip()}' added!")
+                            st.rerun()
+                        else:
+                            st.error(f"Save failed: {r.status_code} — {r.text}")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
         st.divider()
 
@@ -1218,7 +1239,6 @@ def mgr_manage():
                     updated = [new_name.strip() if t == task_to_rename else t
                                for t in current_cols]
                     save_task_cols(updated)
-                    get_task_cols_cached.clear()
                     st.success(f"✅ Renamed to '{new_name.strip()}'!")
                     st.rerun()
 
@@ -1236,7 +1256,6 @@ def mgr_manage():
                 else:
                     updated = [t for t in current_cols if t != task_to_del]
                     save_task_cols(updated)
-                    get_task_cols_cached.clear()
                     st.success(f"✅ Deleted '{task_to_del}'!")
                     st.rerun()
 
@@ -1255,7 +1274,6 @@ def mgr_manage():
             if st.form_submit_button("💾 Save Order"):
                 reordered = [tc for _, tc in sorted(ordered, key=lambda x: x[0])]
                 save_task_cols(reordered)
-                get_task_cols_cached.clear()
                 st.success("✅ Order saved!")
                 st.rerun()
 

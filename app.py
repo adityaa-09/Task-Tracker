@@ -798,16 +798,29 @@ def exec_mark_tasks():
                 and (f_am2=="All" or p["am2"]==f_am2)
                 and (f_proj=="All" or p["name"]==f_proj)]
 
-    # ── Header row ──
-    COLS = [0.3, 1.2, 1.2, 2.4, 0.9, 0.9, 1.0, 0.9, 0.9, 0.65]
-    HDR  = ["Sr.", "AM1", "AM2", "Project",
-            "Review\nMtg", "PPC\nMtg", "Presales\nRev", "Mtg\nCP Agg", "MOM\nNurt.", "Score"]
+    # ── Header row — fully dynamic based on current TASK_COLS ──
+    n = len(TASK_COLS)
+    # Fixed cols: Sr(0.25) + AM1(1.0) + AM2(1.0) + Project(2.0) + Score(0.6)
+    # Task cols share remaining space equally
+    task_width = 0.75
+    COLS = [0.25, 1.0, 1.0, 2.0] + [task_width] * n + [0.6]
+
+    # Short header labels — truncate long names to fit
+    def short_label(tc):
+        words = tc.split()
+        if len(words) == 1:
+            return tc[:8]
+        return "\n".join(w[:6] for w in words[:2])
+
+    HDR = ["Sr.", "AM1", "AM2", "Project"] + [short_label(tc) for tc in TASK_COLS] + ["Score"]
+
     hrow = st.columns(COLS)
     for col, h in zip(hrow, HDR):
         col.markdown(
-            f"<div style='background:#1e3a5f;color:white;font-weight:700;font-size:.7rem;"
-            f"text-align:center;padding:6px 2px;border-radius:6px;line-height:1.3;"
-            f"min-height:36px;display:flex;align-items:center;justify-content:center'>{h}</div>",
+            f"<div style='background:#1e3a5f;color:white;font-weight:700;font-size:.65rem;"
+            f"text-align:center;padding:5px 2px;border-radius:6px;line-height:1.25;"
+            f"min-height:36px;display:flex;align-items:center;justify-content:center;"
+            f"white-space:pre-line'>{h}</div>",
             unsafe_allow_html=True)
     st.divider()
 
@@ -826,16 +839,15 @@ def exec_mark_tasks():
             cur     = task_vals.get(tc, False)
             new_val = row[4+i].checkbox("", value=cur,
                                         key=f"cb_{p['id']}_{tc}_{selected_ws}")
-            # Update cache immediately so score reflects current tick
             st.session_state[cache_key][p["id"]][tc] = new_val
             if new_val != cur:
                 upsert_task(p["id"], p["am1"], p["am2"], tc,
                             "done" if new_val else "pending", ws)
 
-        # Read score from updated cache
+        # Score from updated cache
         score = sum(1 for tc in TASK_COLS
                     if st.session_state[cache_key][p["id"]].get(tc, False))
-        row[9].markdown(score_html(score), unsafe_allow_html=True)
+        row[4+n].markdown(score_html(score), unsafe_allow_html=True)
         sr += 1
 
     st.markdown(f"<p style='color:#94a3b8;font-size:.8rem;margin-top:.5rem'>"
